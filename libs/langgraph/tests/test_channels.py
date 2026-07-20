@@ -12,6 +12,10 @@ from langgraph._internal._typing import MISSING
 from langgraph.channels.binop import BinaryOperatorAggregate
 from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.last_value import LastValue
+from langgraph.channels.named_barrier_value import (
+    NamedBarrierValue,
+    NamedBarrierValueAfterFinish,
+)
 from langgraph.channels.topic import Topic
 from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.errors import EmptyChannelError, InvalidUpdateError
@@ -105,6 +109,52 @@ def test_binop() -> None:
     assert channel.get() == 10
 
 
+def test_binop_overwrite_on_empty_channel() -> None:
+    """A leading `Overwrite` on an empty channel must be unwrapped, not stored
+    as the wrapper object itself."""
+    # `int | None` is not instantiable, so the channel starts empty (MISSING)
+    channel = BinaryOperatorAggregate(int | None, operator.add)
+    assert not channel.is_available()
+
+    channel.update([Overwrite(5)])
+    assert channel.get() == 5
+
+    # subsequent reduces must operate on the unwrapped value
+    channel.update([1, 2])
+    assert channel.get() == 8
+
+
+def test_binop_overwrite_dict_forms_on_empty_channel() -> None:
+    """Both dict-encoded `Overwrite` forms must be unwrapped when they are the
+    first-ever update on an empty channel."""
+    from langgraph._internal._constants import OVERWRITE
+
+    for update in ({OVERWRITE: 7}, {"type": OVERWRITE, "value": 7}):
+        channel = BinaryOperatorAggregate(int | None, operator.add)
+        channel.update([update])
+        assert channel.get() == 7
+
+
+def test_binop_overwrite_then_value_on_empty_channel() -> None:
+    """Values after an `Overwrite` in the same step are ignored, mirroring the
+    non-empty channel semantics."""
+    channel = BinaryOperatorAggregate(int | None, operator.add)
+    channel.update([Overwrite(5), 100])
+    assert channel.get() == 5
+
+    # same semantics as when the channel already holds a value
+    non_empty = BinaryOperatorAggregate(int, operator.add)
+    non_empty.update([Overwrite(5), 100])
+    assert non_empty.get() == 5
+
+
+def test_binop_two_overwrites_on_empty_channel_raises() -> None:
+    """Two Overwrites in one super-step must raise, even on an empty channel."""
+    channel = BinaryOperatorAggregate(int | None, operator.add)
+    with pytest.raises(InvalidUpdateError):
+        channel.update([Overwrite(1), Overwrite(2)])
+
+
 def test_untracked_value() -> None:
     channel = UntrackedValue(dict).from_checkpoint(MISSING)
     assert channel.ValueType is dict
@@ -127,6 +177,97 @@ def test_untracked_value() -> None:
     new_channel = UntrackedValue(dict).from_checkpoint(checkpoint)
     with pytest.raises(EmptyChannelError):
         new_channel.get()
+
+
+def test_topic_checkpoint_isolated_from_later_updates() -> None:
+    channel = Topic(str, accumulate=True).from_checkpoint(MISSING)
+    channel.update(["a", "b"])
+
+    checkpoint = channel.checkpoint()
+    assert checkpoint == ["a", "b"]
+
+    # a later update must not mutate the previously captured checkpoint
+    channel.update(["c"])
+    assert checkpoint == ["a", "b"]
+
+    # non-accumulating topics must also return isolated snapshots
+    channel = Topic(str).from_checkpoint(MISSING)
+    channel.update(["a"])
+    checkpoint = channel.checkpoint()
+    assert checkpoint == ["a"]
+    channel.update(["b"])
+    assert checkpoint == ["a"]
+
+
+def test_topic_from_checkpoint_does_not_mutate_checkpoint() -> None:
+    stored = ["a", "b"]
+
+    channel = Topic(str, accumulate=True).from_checkpoint(stored)
+    channel.update(["c"])
+    assert channel.get() == ["a", "b", "c"]
+    # the stored checkpoint value must be untouched
+    assert stored == ["a", "b"]
+
+    # restoring a second time from the same checkpoint must start fresh
+    channel2 = Topic(str, accumulate=True).from_checkpoint(stored)
+    assert channel2.get() == ["a", "b"]
+
+    # backwards-compat tuple form must also be isolated
+    legacy_values = ["x"]
+    channel3 = Topic(str, accumulate=True).from_checkpoint((None, legacy_values))
+    channel3.update(["y"])
+    assert legacy_values == ["x"]
+
+
+def test_named_barrier_value_checkpoint_isolated_from_later_updates() -> None:
+    channel = NamedBarrierValue(str, {"a", "b"}).from_checkpoint(MISSING)
+    channel.update(["a"])
+
+    checkpoint = channel.checkpoint()
+    assert checkpoint == {"a"}
+
+    # a later update must not mutate the previously captured checkpoint
+    channel.update(["b"])
+    assert checkpoint == {"a"}
+
+
+def test_named_barrier_value_from_checkpoint_does_not_mutate_checkpoint() -> None:
+    stored = {"a"}
+
+    channel = NamedBarrierValue(str, {"a", "b"}).from_checkpoint(stored)
+    channel.update(["b"])
+    assert channel.is_available()
+    # the stored checkpoint value must be untouched
+    assert stored == {"a"}
+
+    # restoring a second time from the same checkpoint must start fresh
+    channel2 = NamedBarrierValue(str, {"a", "b"}).from_checkpoint(stored)
+    assert not channel2.is_available()
+
+
+def test_named_barrier_value_after_finish_checkpoint_isolated() -> None:
+    channel = NamedBarrierValueAfterFinish(str, {"a", "b"}).from_checkpoint(MISSING)
+    channel.update(["a"])
+
+    checkpoint = channel.checkpoint()
+    assert checkpoint[0] == {"a"}
+
+    # a later update must not mutate the previously captured checkpoint
+    channel.update(["b"])
+    assert checkpoint[0] == {"a"}
+
+
+def test_named_barrier_value_after_finish_from_checkpoint_isolated() -> None:
+    stored = ({"a"}, False)
+
+    channel = NamedBarrierValueAfterFinish(str, {"a", "b"}).from_checkpoint(stored)
+    channel.update(["b"])
+    # the stored checkpoint value must be untouched
+    assert stored[0] == {"a"}
+
+    # restoring a second time from the same checkpoint must start fresh
+    channel2 = NamedBarrierValueAfterFinish(str, {"a", "b"}).from_checkpoint(stored)
+    assert channel2.seen == {"a"}
 
 
 # ---------------------------------------------------------------------------

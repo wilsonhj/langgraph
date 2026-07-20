@@ -138,10 +138,12 @@ async def monitor_stream(
 
         if display:
             sys.stdout.buffer.write(line)
-        if overrun:
-            return
         if collect:
+            # collect overrun chunks too, so the returned output is complete
             ba.extend(line)
+        if overrun:
+            # skip on_line for partial chunks — it expects whole lines
+            return
         if on_line:
             if on_line(line.decode()):
                 on_line = None
@@ -159,9 +161,14 @@ async def monitor_stream(
             overrun = False
         except asyncio.LimitOverrunError as e:
             if stream._buffer.startswith(sep, e.consumed):
-                line = stream._buffer[: e.consumed + seplen]
+                line = bytes(stream._buffer[: e.consumed + seplen])
+                # remove the consumed bytes, otherwise the next readuntil()
+                # raises the same LimitOverrunError forever (infinite loop)
+                del stream._buffer[: e.consumed + seplen]
             else:
-                line = stream._buffer.clear()
+                # bytearray.clear() returns None, so capture the bytes first
+                line = bytes(stream._buffer)
+                stream._buffer.clear()
             overrun = True
             stream._maybe_resume_transport()
         await asyncio.to_thread(handle, line, overrun)

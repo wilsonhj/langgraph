@@ -50,6 +50,7 @@ from langgraph.pregel._read import PregelNode
 from langgraph.pregel._retry import (
     _checkpoint_ns_for_parent_command,
     _ensure_execution_info,
+    _next_retry_delay,
     _should_retry_on,
     _TimedAttemptScope,
     arun_with_retry,
@@ -441,6 +442,226 @@ def test_graph_with_multiple_retry_policies():
 
     assert attempt_counts["key_error"] == 3
     assert result_key_error["foo"] == "recovered_from_key_error"
+
+
+def test_multiple_retry_policies_use_independent_budgets():
+    """Each policy spends only its own max_attempts budget.
+
+    Regression: a single shared attempts counter meant earlier failures under
+    one policy consumed another policy's budget — after two ValueErrors, the
+    first KeyError was already "attempt 3", so a max_attempts=3 KeyError
+    policy gave up without retrying it even once.
+    """
+
+    class State(TypedDict):
+        foo: str
+
+    errors = deque([ValueError("v1"), ValueError("v2"), KeyError("k1"), KeyError("k2")])
+
+    def flaky(state):
+        if errors:
+            raise errors.popleft()
+        return {"foo": "recovered"}
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "flaky",
+            flaky,
+            retry_policy=(
+                RetryPolicy(
+                    max_attempts=5,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=ValueError,
+                ),
+                RetryPolicy(
+                    max_attempts=3,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=KeyError,
+                ),
+            ),
+        )
+        .add_edge(START, "flaky")
+        .compile()
+    )
+
+    with patch("time.sleep"):
+        result = graph.invoke({"foo": ""})
+
+    assert result["foo"] == "recovered"
+    assert not errors
+
+
+def test_next_retry_delay_tracks_backoff_per_policy():
+    """Backoff escalation for one policy must not inflate another's."""
+    policies = [
+        RetryPolicy(
+            max_attempts=10,
+            initial_interval=1.0,
+            backoff_factor=2.0,
+            max_interval=100.0,
+            jitter=False,
+            retry_on=ValueError,
+        ),
+        RetryPolicy(
+            max_attempts=10,
+            initial_interval=1.0,
+            backoff_factor=2.0,
+            max_interval=100.0,
+            jitter=False,
+            retry_on=KeyError,
+        ),
+    ]
+    counts: dict[int, int] = {}
+    # consecutive ValueError failures escalate the first policy's backoff
+    assert _next_retry_delay(policies, ValueError(), counts) == 1.0
+    assert _next_retry_delay(policies, ValueError(), counts) == 2.0
+    assert _next_retry_delay(policies, ValueError(), counts) == 4.0
+    # the first KeyError starts at the beginning of its own schedule
+    assert _next_retry_delay(policies, KeyError(), counts) == 1.0
+    # an unmatched exception is never retried
+    assert _next_retry_delay(policies, TypeError(), counts) is None
+
+
+def test_multiple_retry_policies_respect_overall_attempt_ceiling():
+    """Total executions never exceed the most permissive policy's max_attempts.
+
+    Per-policy budgets alone would allow up to `1 + sum(max_attempts_i - 1)`
+    executions; the overall safeguard keeps the documented per-node ceiling
+    ("including the first") at `max(max_attempts)` — the same worst-case bound
+    as the original single-counter implementation.
+    """
+
+    class State(TypedDict):
+        foo: str
+
+    executions = {"count": 0}
+
+    def alternating(state):
+        executions["count"] += 1
+        if executions["count"] % 2 == 1:
+            raise ValueError(f"exec {executions['count']}")
+        raise KeyError(f"exec {executions['count']}")
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "alternating",
+            alternating,
+            retry_policy=(
+                RetryPolicy(
+                    max_attempts=3,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=ValueError,
+                ),
+                RetryPolicy(
+                    max_attempts=3,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=KeyError,
+                ),
+            ),
+        )
+        .add_edge(START, "alternating")
+        .compile()
+    )
+
+    with patch("time.sleep"), pytest.raises(ValueError):
+        graph.invoke({"foo": ""})
+
+    assert executions["count"] == 3
+
+
+def test_multiple_retry_policies_exhaust_after_cross_policy_transition():
+    """A policy's own budget still gives up correctly after switching policies."""
+
+    class State(TypedDict):
+        foo: str
+
+    errors = deque([ValueError("v1"), KeyError("k1"), KeyError("k2")])
+
+    def flaky(state):
+        if errors:
+            raise errors.popleft()
+        return {"foo": "unreachable"}
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "flaky",
+            flaky,
+            retry_policy=(
+                RetryPolicy(
+                    max_attempts=5,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=ValueError,
+                ),
+                RetryPolicy(
+                    max_attempts=2,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=KeyError,
+                ),
+            ),
+        )
+        .add_edge(START, "flaky")
+        .compile()
+    )
+
+    # KeyError budget (max_attempts=2) exhausts on its own second failure,
+    # well under both the ValueError budget and the overall ceiling.
+    with patch("time.sleep"), pytest.raises(KeyError, match="k2"):
+        graph.invoke({"foo": ""})
+    assert len(errors) == 0
+
+
+@pytest.mark.anyio
+async def test_multiple_retry_policies_use_independent_budgets_async():
+    """Async counterpart of the independent-budgets regression test."""
+
+    class State(TypedDict):
+        foo: str
+
+    errors = deque([ValueError("v1"), ValueError("v2"), KeyError("k1"), KeyError("k2")])
+
+    async def flaky(state):
+        if errors:
+            raise errors.popleft()
+        return {"foo": "recovered"}
+
+    graph = (
+        StateGraph(State)
+        .add_node(
+            "flaky",
+            flaky,
+            retry_policy=(
+                RetryPolicy(
+                    max_attempts=5,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=ValueError,
+                ),
+                RetryPolicy(
+                    max_attempts=3,
+                    initial_interval=0.01,
+                    jitter=False,
+                    retry_on=KeyError,
+                ),
+            ),
+        )
+        .add_edge(START, "flaky")
+        .compile()
+    )
+
+    with patch("asyncio.sleep"):
+        result = await graph.ainvoke({"foo": ""})
+
+    assert result["foo"] == "recovered"
+    assert not errors
 
 
 def test_graph_with_max_attempts_exceeded():
@@ -2495,6 +2716,44 @@ def test_set_node_defaults_error_handler_collides_with_user_node():
 
     with pytest.raises(ValueError, match="__default_error_handler__"):
         builder.compile()
+
+
+def test_set_node_defaults_error_handler_compile_twice():
+    """compile() must not mutate the builder: the auto-generated default error
+    handler node must not leak into `builder.nodes`, and compiling the same
+    builder multiple times (e.g. once bare, once with a checkpointer) works."""
+
+    class State(TypedDict):
+        foo: str
+
+    def always_failing(state: State) -> State:
+        raise RuntimeError("boom")
+
+    def default_handler(state: State, error: NodeError) -> State:
+        return {"foo": f"handled_{error.node}"}
+
+    builder = (
+        StateGraph(State)
+        .set_node_defaults(error_handler=default_handler)
+        .add_node("always_failing", always_failing)
+        .add_edge(START, "always_failing")
+    )
+
+    graph1 = builder.compile()
+    # the builder must not be polluted by compile()
+    assert "__default_error_handler__" not in builder.nodes
+    assert builder.nodes["always_failing"].error_handler_node is None
+
+    # second compile of the same builder (supported pattern) must not raise
+    graph2 = builder.compile(checkpointer=MemorySaver())
+    assert "__default_error_handler__" not in builder.nodes
+
+    # both compiled graphs route failures to the default handler
+    assert graph1.invoke({"foo": ""})["foo"] == "handled_always_failing"
+    result2 = graph2.invoke(
+        {"foo": ""}, config={"configurable": {"thread_id": str(uuid4())}}
+    )
+    assert result2["foo"] == "handled_always_failing"
 
 
 def test_set_node_defaults_retry_policy():

@@ -331,6 +331,94 @@ def test_pending_sends_migration(saver_name: str) -> None:
 
 
 @pytest.mark.parametrize("saver_name", ["base", "pool", "pipe"])
+def test_pending_sends_migration_multiple_threads(saver_name: str) -> None:
+    """Regression test: listing checkpoints across multiple threads must
+    migrate pending sends for every thread, not just the first row's thread."""
+    with _saver(saver_name) as saver:
+        sends_by_thread = {
+            "thread-1": ["send-1", "send-2"],
+            "thread-2": ["send-3", "send-4"],
+        }
+        for thread_id, sends in sends_by_thread.items():
+            config = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                }
+            }
+            # create the first checkpoint and put some pending sends
+            checkpoint_0 = empty_checkpoint()
+            config = saver.put(config, checkpoint_0, {}, {})
+            saver.put_writes(config, [(TASKS, s) for s in sends], task_id="task-1")
+            # create the second checkpoint (pending sends attach to it)
+            checkpoint_1 = create_checkpoint(checkpoint_0, {}, 1)
+            saver.put(config, checkpoint_1, {}, {})
+
+        # list across all threads: each thread's second checkpoint must have
+        # its own migrated pending sends
+        search_results = list(saver.list(None))
+        assert len(search_results) == 4
+        migrated = [c for c in search_results if c.parent_config is not None]
+        assert len(migrated) == 2
+        channel_values_by_thread = {
+            c.config["configurable"]["thread_id"]: c.checkpoint["channel_values"]
+            for c in migrated
+        }
+        assert channel_values_by_thread == {
+            thread_id: {TASKS: sends} for thread_id, sends in sends_by_thread.items()
+        }
+        for c in migrated:
+            assert TASKS in c.checkpoint["channel_versions"]
+
+
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe"])
+def test_pending_sends_migration_namespace_isolation(saver_name: str) -> None:
+    """Regression test: two namespaces reusing the same parent checkpoint id
+    must each migrate only their own pending sends — checkpoint identity is
+    (thread_id, checkpoint_ns, checkpoint_id)."""
+    with _saver(saver_name) as saver:
+        parent_id = "00000000-0000-0000-0000-000000000000"
+        child_id = "11111111-1111-1111-1111-111111111111"
+        sends_by_ns = {"": ["root-send"], "child:sub": ["sub-send-1", "sub-send-2"]}
+        for ns, sends in sends_by_ns.items():
+            config = {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ns}}
+            checkpoint_0 = empty_checkpoint()
+            checkpoint_0["id"] = parent_id
+            config = saver.put(config, checkpoint_0, {}, {})
+            saver.put_writes(config, [(TASKS, s) for s in sends], task_id="task-1")
+            checkpoint_1 = create_checkpoint(checkpoint_0, {}, 1, id=child_id)
+            saver.put(config, checkpoint_1, {}, {})
+
+        for ns, sends in sends_by_ns.items():
+            # get_tuple must only see its own namespace's sends
+            tup = saver.get_tuple(
+                {
+                    "configurable": {
+                        "thread_id": "thread-1",
+                        "checkpoint_ns": ns,
+                        "checkpoint_id": child_id,
+                    }
+                }
+            )
+            assert tup is not None
+            assert tup.checkpoint["channel_values"].get(TASKS) == sends, ns
+
+        # cross-namespace list() must attach each namespace's sends only to
+        # its own descendant
+        results = [
+            c
+            for c in saver.list({"configurable": {"thread_id": "thread-1"}})
+            if c.parent_config is not None
+        ]
+        assert len(results) == 2
+        by_ns = {
+            c.config["configurable"]["checkpoint_ns"]: c.checkpoint["channel_values"]
+            for c in results
+        }
+        assert by_ns == {ns: {TASKS: sends} for ns, sends in sends_by_ns.items()}
+
+
+@pytest.mark.parametrize("saver_name", ["base", "pool", "pipe"])
 def test_get_checkpoint_no_channel_values(
     monkeypatch, saver_name: str, test_data
 ) -> None:
